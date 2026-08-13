@@ -1,7 +1,6 @@
+streamlit
 fastapi
-uvicorn[standard]
-torch
-torchvision
+uvicorn
 ultralytics
 easyocr
 opencv-python-headless

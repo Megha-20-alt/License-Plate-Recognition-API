@@ -1,3 +1,15 @@
+import gc
+import os
+
+# Limit PyTorch CPU threading.
+# Render Free has very limited CPU resources.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+import torch
+
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
 from fastapi import FastAPI, UploadFile, File, Depends
 from fastapi.staticfiles import StaticFiles
@@ -8,18 +20,33 @@ from ultralytics import YOLO
 import easyocr
 import cv2
 import numpy as np
+
 from sqlalchemy.orm import Session
 
 from .database import get_db
 from .models import PlateDetection
 
 
+# --------------------------------------------------
+# FastAPI application
+# --------------------------------------------------
+
 app = FastAPI(
     title="License Plate Recognition API",
     description="Detects license plates using YOLO and reads them using EasyOCR.",
     version="1.0.0"
 )
-app.mount("/static", StaticFiles(directory="frontend"), name="static")
+
+
+# --------------------------------------------------
+# Frontend
+# --------------------------------------------------
+
+app.mount(
+    "/static",
+    StaticFiles(directory="frontend"),
+    name="static"
+)
 
 
 # --------------------------------------------------
@@ -36,26 +63,53 @@ app.add_middleware(
 
 
 # --------------------------------------------------
-# Load YOLO model
+# YOLO model
 # --------------------------------------------------
 
 model = YOLO("models/best.pt")
 
 
 # --------------------------------------------------
-# Load EasyOCR
+# EasyOCR
 # --------------------------------------------------
 
-reader = easyocr.Reader(["en"], gpu=False)
+# Do NOT initialize EasyOCR at startup.
+#
+# This saves startup memory and can allow the web
+# server to start before OCR is needed.
+
+reader = None
+
+
+def get_ocr_reader():
+    """
+    Create the EasyOCR reader only when OCR is
+    actually required.
+    """
+
+    global reader
+
+    if reader is None:
+
+        reader = easyocr.Reader(
+            ["en"],
+            gpu=False,
+            verbose=False
+        )
+
+    return reader
 
 
 # --------------------------------------------------
-# Frontend
+# Home
 # --------------------------------------------------
 
 @app.get("/")
 def home():
-    return FileResponse("frontend/index.html")
+
+    return FileResponse(
+        "frontend/index.html"
+    )
 
 
 # --------------------------------------------------
@@ -68,140 +122,281 @@ async def predict(
     db: Session = Depends(get_db)
 ):
 
+    # --------------------------------------------------
+    # Read uploaded file
+    # --------------------------------------------------
+
     contents = await file.read()
+
+    if not contents:
+
+        return {
+            "error": "Empty file"
+        }
+
+
+    # --------------------------------------------------
+    # Convert bytes -> NumPy array
+    # --------------------------------------------------
 
     image_array = np.frombuffer(
         contents,
-        np.uint8
+        dtype=np.uint8
     )
+
+
+    # --------------------------------------------------
+    # Decode image
+    # --------------------------------------------------
 
     image = cv2.imdecode(
         image_array,
         cv2.IMREAD_COLOR
     )
 
+    # We no longer need the original byte array.
+    del image_array
+    del contents
+
+
     if image is None:
+
         return {
             "error": "Invalid image"
         }
 
 
-    # YOLO detection
+    # --------------------------------------------------
+    # Limit input image resolution
+    # --------------------------------------------------
 
-    results = model(
-        image,
-        conf=0.4,
-        verbose=False
-    )[0]
+    MAX_WIDTH = 1280
 
+    height, width = image.shape[:2]
+
+    if width > MAX_WIDTH:
+
+        scale = MAX_WIDTH / width
+
+        new_width = MAX_WIDTH
+        new_height = int(height * scale)
+
+        image = cv2.resize(
+            image,
+            (new_width, new_height),
+            interpolation=cv2.INTER_AREA
+        )
+
+
+    # --------------------------------------------------
+    # YOLO inference
+    # --------------------------------------------------
+
+    with torch.inference_mode():
+
+        results = model.predict(
+            source=image,
+            conf=0.4,
+            device="cpu",
+            imgsz=416,
+            max_det=10,
+            verbose=False
+        )
+
+
+    # Get first result only.
+    result = results[0]
 
     plates = []
 
 
-    for box in results.boxes:
+    # --------------------------------------------------
+    # Process detected plates
+    # --------------------------------------------------
 
-        coordinates = (
-            box.xyxy[0]
-            .cpu()
-            .numpy()
-            .astype(int)
-        )
+    if result.boxes is not None:
 
-        x1 = int(coordinates[0])
-        y1 = int(coordinates[1])
-        x2 = int(coordinates[2])
-        y2 = int(coordinates[3])
+        for box in result.boxes:
 
+            # ------------------------------------------
+            # Bounding box
+            # ------------------------------------------
 
-        confidence = float(
-            box.conf[0]
-        )
+            coordinates = (
+                box.xyxy[0]
+                .cpu()
+                .numpy()
+                .astype(int)
+            )
 
-
-        # Crop plate
-
-        crop = image[
-            y1:y2,
-            x1:x2
-        ]
-
-        if crop.size == 0:
-            continue
+            x1 = int(coordinates[0])
+            y1 = int(coordinates[1])
+            x2 = int(coordinates[2])
+            y2 = int(coordinates[3])
 
 
-        # Grayscale
+            # ------------------------------------------
+            # Keep coordinates inside image
+            # ------------------------------------------
 
-        gray = cv2.cvtColor(
-            crop,
-            cv2.COLOR_BGR2GRAY
-        )
-
-
-        # Resize
-
-        gray = cv2.resize(
-            gray,
-            None,
-            fx=2,
-            fy=2,
-            interpolation=cv2.INTER_CUBIC
-        )
+            x1 = max(0, min(x1, image.shape[1]))
+            y1 = max(0, min(y1, image.shape[0]))
+            x2 = max(0, min(x2, image.shape[1]))
+            y2 = max(0, min(y2, image.shape[0]))
 
 
-        # OCR
+            if x2 <= x1 or y2 <= y1:
+                continue
 
-        ocr_result = reader.readtext(gray)
 
-        text = ""
+            # ------------------------------------------
+            # Confidence
+            # ------------------------------------------
 
-        if ocr_result:
-
-            text = " ".join(
-                result[1]
-                for result in ocr_result
+            confidence = float(
+                box.conf[0].cpu().item()
             )
 
 
-        # Clean OCR text
+            # ------------------------------------------
+            # Crop license plate
+            # ------------------------------------------
 
-        text = "".join(
-            c for c in text
-            if c.isalnum() or c == " "
-        )
-
-        text = text.strip().upper()
-
-
-        # Save to database
-
-        detection = PlateDetection(
-            plate_number=text,
-            detection_confidence=confidence,
-            x1=x1,
-            y1=y1,
-            x2=x2,
-            y2=y2
-        )
-
-        db.add(detection)
-
-
-        # Add to response
-
-        plates.append({
-            "text": text,
-            "confidence": confidence,
-            "box": [
-                x1,
-                y1,
-                x2,
-                y2
+            crop = image[
+                y1:y2,
+                x1:x2
             ]
-        })
 
+
+            if crop.size == 0:
+                continue
+
+
+            # ------------------------------------------
+            # Grayscale
+            # ------------------------------------------
+
+            gray = cv2.cvtColor(
+                crop,
+                cv2.COLOR_BGR2GRAY
+            )
+
+
+            # ------------------------------------------
+            # Smaller OCR enlargement
+            # ------------------------------------------
+
+            gray = cv2.resize(
+                gray,
+                None,
+                fx=1.5,
+                fy=1.5,
+                interpolation=cv2.INTER_CUBIC
+            )
+
+
+            # ------------------------------------------
+            # EasyOCR
+            # ------------------------------------------
+
+            ocr_reader = get_ocr_reader()
+
+            ocr_result = ocr_reader.readtext(
+                gray,
+                detail=1,
+                paragraph=False
+            )
+
+
+            # ------------------------------------------
+            # Extract text
+            # ------------------------------------------
+
+            text = ""
+
+            if ocr_result:
+
+                text = " ".join(
+                    result[1]
+                    for result in ocr_result
+                )
+
+
+            # ------------------------------------------
+            # Clean text
+            # ------------------------------------------
+
+            text = "".join(
+                c for c in text
+                if c.isalnum() or c == " "
+            )
+
+            text = text.strip().upper()
+
+
+            # ------------------------------------------
+            # Save database record
+            # ------------------------------------------
+
+            detection = PlateDetection(
+                plate_number=text,
+                detection_confidence=confidence,
+                x1=x1,
+                y1=y1,
+                x2=x2,
+                y2=y2
+            )
+
+            db.add(detection)
+
+
+            # ------------------------------------------
+            # API response
+            # ------------------------------------------
+
+            plates.append({
+                "text": text,
+                "confidence": confidence,
+                "box": [
+                    x1,
+                    y1,
+                    x2,
+                    y2
+                ]
+            })
+
+
+            # ------------------------------------------
+            # Release OCR temporary memory
+            # ------------------------------------------
+
+            del gray
+            del crop
+
+
+    # --------------------------------------------------
+    # Commit database changes
+    # --------------------------------------------------
 
     db.commit()
 
+
+    # --------------------------------------------------
+    # Release temporary YOLO objects
+    # --------------------------------------------------
+
+    del result
+    del results
+    del image
+
+
+    # Ask Python to release unused objects.
+    gc.collect()
+
+
+    # --------------------------------------------------
+    # Return response
+    # --------------------------------------------------
 
     return {
         "plates": plates
@@ -209,7 +404,7 @@ async def predict(
 
 
 # --------------------------------------------------
-# Get previous detections
+# Detection history
 # --------------------------------------------------
 
 @app.get("/detections")
@@ -221,22 +416,27 @@ def get_detections(
         PlateDetection
     ).all()
 
+
     return {
         "detections": [
+
             {
                 "id": detection.id,
+
                 "plate_number": detection.plate_number,
+
                 "confidence": detection.detection_confidence,
+
                 "box": [
                     detection.x1,
                     detection.y1,
                     detection.x2,
                     detection.y2
                 ],
+
                 "created_at": detection.created_at
             }
 
             for detection in detections
         ]
     }
-
