@@ -1,5 +1,9 @@
 
 from fastapi import FastAPI, UploadFile, File, Depends
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+
 from ultralytics import YOLO
 import easyocr
 import cv2
@@ -15,25 +19,43 @@ app = FastAPI(
     description="Detects license plates using YOLO and reads them using EasyOCR.",
     version="1.0.0"
 )
+app.mount("/static", StaticFiles(directory="frontend"), name="static")
 
 
+# --------------------------------------------------
+# CORS
+# --------------------------------------------------
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+
+# --------------------------------------------------
 # Load YOLO model
+# --------------------------------------------------
+
 model = YOLO("models/best.pt")
 
 
+# --------------------------------------------------
 # Load EasyOCR
+# --------------------------------------------------
+
 reader = easyocr.Reader(["en"], gpu=False)
 
 
 # --------------------------------------------------
-# Home
+# Frontend
 # --------------------------------------------------
 
 @app.get("/")
 def home():
-    return {
-        "message": "License Plate Recognition API is running!"
-    }
+    return FileResponse("frontend/index.html")
 
 
 # --------------------------------------------------
@@ -46,13 +68,13 @@ async def predict(
     db: Session = Depends(get_db)
 ):
 
-    # Read uploaded image
     contents = await file.read()
 
-    # Convert bytes to NumPy array
-    image_array = np.frombuffer(contents, np.uint8)
+    image_array = np.frombuffer(
+        contents,
+        np.uint8
+    )
 
-    # Decode image
     image = cv2.imdecode(
         image_array,
         cv2.IMREAD_COLOR
@@ -64,9 +86,7 @@ async def predict(
         }
 
 
-    # --------------------------------------------------
     # YOLO detection
-    # --------------------------------------------------
 
     results = model(
         image,
@@ -78,13 +98,8 @@ async def predict(
     plates = []
 
 
-    # --------------------------------------------------
-    # Process detected plates
-    # --------------------------------------------------
-
     for box in results.boxes:
 
-        # Get bounding box
         coordinates = (
             box.xyxy[0]
             .cpu()
@@ -98,15 +113,12 @@ async def predict(
         y2 = int(coordinates[3])
 
 
-        # Confidence
         confidence = float(
             box.conf[0]
         )
 
 
-        # --------------------------------------------------
-        # Crop license plate
-        # --------------------------------------------------
+        # Crop plate
 
         crop = image[
             y1:y2,
@@ -117,9 +129,7 @@ async def predict(
             continue
 
 
-        # --------------------------------------------------
-        # Convert to grayscale
-        # --------------------------------------------------
+        # Grayscale
 
         gray = cv2.cvtColor(
             crop,
@@ -127,9 +137,7 @@ async def predict(
         )
 
 
-        # --------------------------------------------------
         # Resize
-        # --------------------------------------------------
 
         gray = cv2.resize(
             gray,
@@ -140,9 +148,7 @@ async def predict(
         )
 
 
-        # --------------------------------------------------
         # OCR
-        # --------------------------------------------------
 
         ocr_result = reader.readtext(gray)
 
@@ -156,7 +162,8 @@ async def predict(
             )
 
 
-        # Keep only letters, numbers and spaces
+        # Clean OCR text
+
         text = "".join(
             c for c in text
             if c.isalnum() or c == " "
@@ -165,9 +172,7 @@ async def predict(
         text = text.strip().upper()
 
 
-        # --------------------------------------------------
-        # Save detection to database
-        # --------------------------------------------------
+        # Save to database
 
         detection = PlateDetection(
             plate_number=text,
@@ -181,9 +186,7 @@ async def predict(
         db.add(detection)
 
 
-        # --------------------------------------------------
-        # Add to API response
-        # --------------------------------------------------
+        # Add to response
 
         plates.append({
             "text": text,
@@ -197,22 +200,26 @@ async def predict(
         })
 
 
-    # Commit database changes
     db.commit()
 
-
-    # --------------------------------------------------
-    # Return response
-    # --------------------------------------------------
 
     return {
         "plates": plates
     }
+
+
+# --------------------------------------------------
+# Get previous detections
+# --------------------------------------------------
+
 @app.get("/detections")
 def get_detections(
     db: Session = Depends(get_db)
 ):
-    detections = db.query(PlateDetection).all()
+
+    detections = db.query(
+        PlateDetection
+    ).all()
 
     return {
         "detections": [
@@ -228,6 +235,7 @@ def get_detections(
                 ],
                 "created_at": detection.created_at
             }
+
             for detection in detections
         ]
     }
