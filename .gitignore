@@ -1,0 +1,47 @@
+```text
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# YOLO / Ultralytics
+runs/
+*.cache/
+
+# Dataset
+data/
+
+# Python environment files
+.env
+.env.*
+
+# IDE / editor
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+*.db
+yolov8n.pt
+models/best.zip
+models/best_fixed.zip
+models/best_original/
+```
